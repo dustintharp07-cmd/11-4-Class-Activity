@@ -1,0 +1,538 @@
+---
+title: "Race and Population in Florida"
+subtitle: "How the racial composition of county populations varies across the state"
+format:
+  html:
+    theme: cosmo
+    toc: false
+    code-fold: false
+    embed-resources: false
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: prepare-data
+
+library(dplyr)
+library(leaflet)
+library(readr)
+library(sf)
+library(stringr)
+
+base_url <- "https://www2.census.gov/programs-surveys/acs/summary_file/2024/table-based-SF"
+table_url <- paste0(base_url, "/data/5YRData/acsdt5y2024-b02001.dat")
+shell_url <- paste0(base_url, "/documentation/ACS20245YR_Table_Shells.txt")
+boundary_url <- "https://www2.census.gov/geo/tiger/GENZ2024/shp/cb_2024_us_county_500k.zip"
+work_dir <- tempdir()
+table_file <- file.path(work_dir, "acsdt5y2024-b02001.dat")
+shell_file <- file.path(work_dir, "ACS20245YR_Table_Shells.txt")
+boundary_file <- file.path(work_dir, "cb_2024_us_county_500k.zip")
+
+download_if_missing <- function(url, path) {
+  if (!file.exists(path) || file.info(path)$size == 0) {
+    curl::curl_download(url, path, quiet = TRUE)
+  }
+}
+
+download_if_missing(table_url, table_file)
+download_if_missing(shell_url, shell_file)
+download_if_missing(boundary_url, boundary_file)
+
+race_keys <- c("white", "black", "aian", "asian", "nhpi", "other", "two_or_more")
+table_ids <- sprintf("B02001_%03d", 1:8)
+estimate_columns <- paste0("B02001_E", sprintf("%03d", 1:8))
+population_columns <- c("total_population", paste0(race_keys, "_population"))
+percentage_columns <- paste0(race_keys, "_percent")
+
+shell <- read_delim(
+  shell_file,
+  delim = "|",
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE,
+  progress = FALSE
+) |>
+  filter(.data[["Table ID"]] == "B02001")
+
+shell_labels <- shell$Label[match(table_ids, shell$`Unique ID`)]
+expected_shell_labels <- c(
+  "Total:",
+  "White alone",
+  "Black or African American alone",
+  "American Indian and Alaska Native alone",
+  "Asian alone",
+  "Native Hawaiian and Other Pacific Islander alone",
+  "Some Other Race alone",
+  "Two or More Races:"
+)
+if (!identical(shell_labels, expected_shell_labels)) {
+  stop("The official B02001 table shell labels differ from the expected race categories.")
+}
+
+data_header <- strsplit(read_lines(table_file, n_max = 1), "|", fixed = TRUE)[[1]]
+if (!all(c("GEO_ID", estimate_columns) %in% data_header)) {
+  stop("The downloaded B02001 data file does not have the expected estimate columns.")
+}
+
+census_counties <- read_delim(
+  table_file,
+  delim = "|",
+  col_select = all_of(c("GEO_ID", estimate_columns)),
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE,
+  progress = FALSE
+) |>
+  filter(str_starts(GEO_ID, "0500000US12"), str_length(GEO_ID) == 14) |>
+  transmute(
+    GEOID = str_sub(GEO_ID, -5L),
+    across(all_of(estimate_columns), as.numeric)
+  ) |>
+  setNames(c("GEOID", population_columns))
+
+if (nrow(census_counties) != 67L || anyDuplicated(census_counties$GEOID)) {
+  stop("The official B02001 file must contain one record for each of Florida's 67 counties.")
+}
+
+utils::unzip(boundary_file, exdir = work_dir)
+boundary_path <- file.path(work_dir, "cb_2024_us_county_500k.shp")
+florida_boundaries <- st_read(boundary_path, quiet = TRUE) |>
+  filter(STATEFP == "12") |>
+  st_transform(4326)
+
+if (nrow(florida_boundaries) != 67L || anyDuplicated(florida_boundaries$GEOID)) {
+  stop("The official TIGER/Line boundaries must contain one record for each Florida county.")
+}
+
+if (!setequal(florida_boundaries$GEOID, census_counties$GEOID)) {
+  stop("The Census GEOIDs do not match the Florida county boundary GEOIDs.")
+}
+
+counties <- florida_boundaries |>
+  left_join(census_counties, by = "GEOID") |>
+  mutate(
+    across(all_of(population_columns), as.numeric)
+  )
+
+if (anyNA(st_drop_geometry(counties)[population_columns]) ||
+    any(counties$total_population <= 0)) {
+  stop("One or more Florida counties have missing or invalid population estimates.")
+}
+
+for (i in seq_along(race_keys)) {
+  counties[[percentage_columns[[i]]]] <-
+    counties[[paste0(race_keys[[i]], "_population")]] /
+    counties$total_population * 100
+}
+
+if (any(!is.finite(as.matrix(st_drop_geometry(counties)[percentage_columns]))) ||
+    any(abs(rowSums(st_drop_geometry(counties)[percentage_columns]) - 100) > 0.1)) {
+  stop("The B02001 race percentages failed validation against total county population.")
+}
+
+map_data <- counties |>
+  select(
+    GEOID,
+    county = NAME,
+    all_of(population_columns),
+    all_of(percentage_columns)
+  ) |>
+  st_simplify(preserveTopology = TRUE, dTolerance = 0.003)
+
+geojson <- jsonlite::fromJSON(
+  geojsonsf::sf_geojson(map_data, factors_as_string = TRUE),
+  simplifyVector = FALSE
+)
+map_bounds <- as.numeric(st_bbox(counties))
+```
+
+<div class="controls">
+  <label for="race-select">Race category</label>
+  <select id="race-select" aria-label="Select a race category">
+    <option value="white">White alone</option>
+    <option value="black">Black or African American alone</option>
+    <option value="aian">American Indian and Alaska Native alone</option>
+    <option value="asian">Asian alone</option>
+    <option value="nhpi">Native Hawaiian and Other Pacific Islander alone</option>
+    <option value="other">Some other race alone</option>
+    <option value="two_or_more">Two or more races</option>
+  </select>
+  <span id="map-measure">Percentage of county population</span>
+</div>
+
+```{r}
+#| label: florida-map
+#| fig-width: 12
+#| fig-height: 7
+#| out-width: 100%
+
+map_widget <- leaflet(
+  options = leafletOptions(
+    zoomControl = TRUE,
+    scrollWheelZoom = TRUE,
+    preferCanvas = TRUE
+  )
+) |>
+  addProviderTiles("CartoDB.Positron") |>
+  htmlwidgets::onRender(
+    "
+    function(el, x, data) {
+      var map = this;
+      var colors = ['#eff3ff', '#c6dbef', '#9ecae1', '#4292c6', '#084594'];
+      var labels = {
+        white: 'White alone',
+        black: 'Black or African American alone',
+        aian: 'American Indian and Alaska Native alone',
+        asian: 'Asian alone',
+        nhpi: 'Native Hawaiian and Other Pacific Islander alone',
+        other: 'Some other race alone',
+        two_or_more: 'Two or more races'
+      };
+      var selected = 'white';
+      var selectedCounty = null;
+      var legend;
+      var panel = element('aside', 'county-panel');
+      panel.id = 'county-info';
+      panel.setAttribute('aria-live', 'polite');
+      panel.appendChild(element('h2', '', 'Explore a county'));
+      panel.appendChild(element('p', '', 'Select any county to see its population estimates and racial composition.'));
+      el.appendChild(panel);
+      L.DomEvent.disableClickPropagation(panel);
+      L.DomEvent.disableScrollPropagation(panel);
+      var selector = document.getElementById('race-select');
+      var measure = document.getElementById('map-measure');
+
+      function element(tag, className, text) {
+        var node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function formatCount(value) {
+        return Number(value).toLocaleString('en-US');
+      }
+
+      function getValues() {
+        return data.geojson.features.map(function(feature) {
+          return Number(feature.properties[selected + '_percent']);
+        }).filter(Number.isFinite).sort(function(a, b) { return a - b; });
+      }
+
+      function quantile(sorted, fraction) {
+        return sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))];
+      }
+
+      function updateLegend() {
+        var values = getValues();
+        var cuts = [0.2, 0.4, 0.6, 0.8].map(function(q) {
+          return quantile(values, q);
+        });
+        var control = element('div', 'race-legend');
+        control.appendChild(element('strong', '', 'County population'));
+        var rows = element('div', 'legend-scale');
+        colors.forEach(function(color, i) {
+          var row = element('div', 'legend-row');
+          var swatch = element('span', 'legend-swatch');
+          swatch.style.backgroundColor = color;
+          var lower = i === 0 ? 0 : cuts[i - 1];
+          var upper = i === 4 ? values[values.length - 1] : cuts[i];
+          row.appendChild(swatch);
+          row.appendChild(element('span', '', lower.toFixed(1) + '–' + upper.toFixed(1) + '%'));
+          rows.appendChild(row);
+        });
+        control.appendChild(rows);
+        if (legend) legend.remove();
+        legend = L.control({position: 'bottomright'});
+        legend.onAdd = function() { return control; };
+        legend.addTo(map);
+      }
+
+      function styleFeature(feature) {
+        var value = Number(feature.properties[selected + '_percent']);
+        var values = getValues();
+        var cuts = [0.2, 0.4, 0.6, 0.8].map(function(q) {
+          return quantile(values, q);
+        });
+        var index = cuts.findIndex(function(cut) { return value <= cut; });
+        if (index < 0) index = 4;
+        return {
+          color: '#ffffff',
+          weight: 1,
+          opacity: 0.95,
+          fillColor: colors[index],
+          fillOpacity: 0.88
+        };
+      }
+
+      function tooltip(feature) {
+        var p = feature.properties;
+        var box = element('div', 'county-tooltip');
+        box.appendChild(element('strong', '', p.county + ' County'));
+        box.appendChild(element('span', '', labels[selected]));
+        box.appendChild(element('span', '', formatCount(p[selected + '_population']) + ' of ' +
+          formatCount(p.total_population) + ' people'));
+        box.appendChild(element('b', '', Number(p[selected + '_percent']).toFixed(1) +
+          '% of county population'));
+        return box;
+      }
+
+      function showCounty(feature) {
+        var p = feature.properties;
+        selectedCounty = feature;
+        panel.replaceChildren();
+        panel.appendChild(element('h2', '', p.county + ' County'));
+        panel.appendChild(element('p', 'county-total', 'Total population: ' +
+          formatCount(p.total_population)));
+        var table = element('table', 'county-table');
+        var head = element('thead');
+        var header = element('tr');
+        ['Race category', 'Estimate', 'Share'].forEach(function(text) {
+          header.appendChild(element('th', '', text));
+        });
+        head.appendChild(header);
+        table.appendChild(head);
+        var body = element('tbody');
+        Object.keys(labels).forEach(function(key) {
+          var row = element('tr');
+          row.appendChild(element('td', '', labels[key]));
+          row.appendChild(element('td', '', formatCount(p[key + '_population'])));
+          row.appendChild(element('td', '', Number(p[key + '_percent']).toFixed(1) + '%'));
+          body.appendChild(row);
+        });
+        table.appendChild(body);
+        panel.appendChild(table);
+      }
+
+      var counties = L.geoJSON(data.geojson, {
+        style: styleFeature,
+        onEachFeature: function(feature, layer) {
+          layer.bindTooltip(tooltip(feature), {
+            sticky: true,
+            direction: 'top',
+            className: 'race-tooltip'
+          });
+          layer.on({
+            mouseover: function(event) {
+              event.target.setStyle({weight: 2, color: '#172b4d', fillOpacity: 1});
+              event.target.openTooltip();
+            },
+            mouseout: function(event) {
+              counties.resetStyle(event.target);
+              event.target.closeTooltip();
+            },
+            click: function() {
+              showCounty(feature);
+            }
+          });
+        }
+      }).addTo(map);
+
+      selector.addEventListener('change', function() {
+        selected = selector.value;
+        measure.textContent = 'Percentage of county population · ' + labels[selected];
+        counties.eachLayer(function(layer) {
+          layer.setStyle(styleFeature(layer.feature));
+          layer.setTooltipContent(tooltip(layer.feature));
+        });
+        if (selectedCounty) showCounty(selectedCounty);
+        updateLegend();
+      });
+
+      updateLegend();
+      map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]],
+        {padding: [22, 22]});
+
+      var reset = L.control({position: 'topleft'});
+      reset.onAdd = function() {
+        var button = element('button', 'reset-view', 'Reset view');
+        button.type = 'button';
+        button.title = 'Show all Florida counties';
+        L.DomEvent.disableClickPropagation(button);
+        L.DomEvent.on(button, 'click', function() {
+          map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]],
+            {padding: [22, 22]});
+        });
+        return button;
+      };
+      reset.addTo(map);
+    }
+    ",
+    data = list(geojson = geojson, bounds = map_bounds)
+  )
+
+map_widget
+```
+
+<div class="map-caption">Select a race category to update the map. Hover over a county for details, or click it to compare all categories.</div>
+
+## Data and methodology
+
+**Source:** U.S. Census Bureau, American Community Survey 2020–2024 5-Year Estimates, Detailed Table B02001 — Race. The estimates are downloaded from the Census Bureau's public [2024 table-based ACS Summary File](https://www.census.gov/programs-surveys/acs/data/summary-file.2024.html), then joined to official 2024 TIGER/Line county boundaries by five-digit county GEOID. All 67 Florida counties are included.
+
+Each mapped value is the selected race-alone estimate divided by the county's B02001 total population estimate, multiplied by 100. ACS figures are survey estimates. Census race-alone categories describe race; Hispanic or Latino origin is a separate ethnicity classification and is not included as a mutually exclusive race category in this map.
+
+<style>
+  body {
+    color: #233044;
+    font-family: Inter, "Segoe UI", sans-serif;
+  }
+  h1, h2 {
+    color: #18324b;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.65rem 1rem;
+    margin: 1rem 0 0.5rem;
+  }
+  .controls > p {
+    display: contents;
+    margin: 0;
+  }
+  .controls label {
+    color: #18324b;
+    font-size: 0.95rem;
+    font-weight: 650;
+  }
+  #race-select {
+    max-width: 100%;
+    min-width: 16rem;
+    padding: 0.55rem 2rem 0.55rem 0.7rem;
+    border: 1px solid #c9d4df;
+    border-radius: 0.45rem;
+    background: #fff;
+    color: #233044;
+    font: inherit;
+  }
+  #map-measure {
+    color: #607387;
+    font-size: 0.9rem;
+  }
+  .leaflet-container {
+    height: min(72vh, 700px) !important;
+    min-height: 480px;
+    border: 1px solid #dfe6ed;
+    border-radius: 0.65rem;
+    font-family: inherit;
+  }
+  .county-panel {
+    position: absolute;
+    z-index: 500;
+    top: 1rem;
+    left: 1rem;
+    width: min(310px, calc(100% - 2rem));
+    max-height: min(420px, 58%);
+    overflow: auto;
+    padding: 1rem 1.1rem;
+    border: 1px solid #dfe6ed;
+    border-radius: 0.6rem;
+    background: rgba(255, 255, 255, 0.97);
+    box-shadow: 0 3px 14px rgba(27, 47, 69, 0.15);
+  }
+  .county-panel h2 {
+    margin: 0 0 0.35rem;
+    font-size: 1.05rem;
+  }
+  .county-panel p {
+    margin: 0.2rem 0 0.7rem;
+    color: #607387;
+    font-size: 0.88rem;
+  }
+  .county-panel .county-total {
+    color: #233044;
+    font-weight: 600;
+  }
+  .county-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .county-table th, .county-table td {
+    padding: 0.3rem 0.18rem;
+    border-bottom: 1px solid #edf1f5;
+    text-align: left;
+  }
+  .county-table th {
+    color: #607387;
+    font-weight: 600;
+  }
+  .county-table td:nth-child(2), .county-table td:nth-child(3),
+  .county-table th:nth-child(2), .county-table th:nth-child(3) {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .race-legend {
+    padding: 0.7rem 0.85rem;
+    border: 1px solid #dfe6ed;
+    border-radius: 0.45rem;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 1px 5px rgba(27, 47, 69, 0.12);
+    color: #233044;
+    font-size: 0.76rem;
+  }
+  .legend-scale {
+    display: grid;
+    grid-template-columns: repeat(5, auto);
+    gap: 0.45rem;
+    margin-top: 0.45rem;
+  }
+  .legend-row {
+    display: grid;
+    gap: 0.25rem;
+    justify-items: center;
+    white-space: nowrap;
+  }
+  .legend-swatch {
+    width: 1.6rem;
+    height: 0.6rem;
+    border-radius: 2px;
+  }
+  .county-tooltip {
+    display: grid;
+    gap: 0.2rem;
+    color: #233044;
+    font-size: 0.82rem;
+  }
+  .county-tooltip strong {
+    color: #18324b;
+    font-size: 0.9rem;
+  }
+  .reset-view {
+    margin: 0.5rem 0 0 3.2rem;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid #c9d4df;
+    border-radius: 0.35rem;
+    background: #fff;
+    color: #233044;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    box-shadow: 0 1px 5px rgba(27, 47, 69, 0.15);
+  }
+  .map-caption {
+    margin: 0.55rem 0 1.5rem;
+    color: #607387;
+    font-size: 0.85rem;
+  }
+  @media (max-width: 600px) {
+    .leaflet-container {
+      min-height: 520px;
+      height: 68vh !important;
+    }
+    .county-panel {
+      top: auto;
+      bottom: 1rem;
+      max-height: 48%;
+    }
+    .legend-scale {
+      gap: 0.25rem;
+    }
+    .legend-swatch {
+      width: 1.1rem;
+    }
+  }
+</style>
